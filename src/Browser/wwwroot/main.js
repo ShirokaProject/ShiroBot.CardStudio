@@ -1,5 +1,5 @@
 import './assets.js';
-import { waitForIntro, studioReady, studioFailed } from './splash.js';
+import { waitForIntro, studioReady, studioFailed, studioStillLoading } from './splash.js';
 
 const editorHost = document.getElementById('out');
 let composing = false;
@@ -76,10 +76,8 @@ const observer = new MutationObserver(() => {
   if (host.querySelector('canvas.avalonia-canvas')) showStudio();
 });
 observer.observe(host, { childList: true, subtree: true });
-const startupTimeout = setTimeout(() => {
-  observer.disconnect();
-  studioFailed(new Error('Avalonia did not create its canvas within 45 seconds'));
-}, 45_000);
+// Slow downloads are still valid startup attempts. Keep watching for the canvas.
+const startupTimeout = setTimeout(studioStillLoading, 45_000);
 
 try {
   const { dotnet } = await import('./_framework/dotnet.js');

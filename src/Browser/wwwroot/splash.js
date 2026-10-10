@@ -67,6 +67,12 @@ export function studioReady() {
   });
 }
 
+export function studioStillLoading() {
+  if (settled) return;
+  message.textContent = '加载时间较长，正在继续准备编辑器…';
+  retry.hidden = false;
+}
+
 export function studioFailed(error) {
   if (settled) return;
   settled = true;

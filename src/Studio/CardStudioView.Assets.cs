@@ -1,6 +1,8 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Input;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform.Storage;
 
@@ -10,7 +12,8 @@ public sealed partial class CardStudioView
 {
     private sealed record ImageAsset(string Id, string Name, string Base64)
     {
-        public override string ToString() => Name;
+        [System.Text.Json.Serialization.JsonIgnore]
+        public Bitmap? Preview { get; set; }
     }
 
     private readonly List<ImageAsset> _imageAssets = [];
@@ -45,14 +48,85 @@ public sealed partial class CardStudioView
             }
             catch (Exception ex) { _statusText.Text = "清理失败：" + GetUsefulError(ex); }
         };
-        this.FindControl<Button>("InsertImageButton")!.Click += (_, _) =>
+    }
+
+    private void InsertImageAssetClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        if ((sender as Control)?.DataContext is not ImageAsset row) return;
+        var asset = _imageAssets.FirstOrDefault(x => x.Base64 == row.Base64);
+        if (asset is null) return;
+        this.FindControl<TabControl>("EditorTabs")!.SelectedIndex = 0;
+        _codeEditor.Document.Insert(_codeEditor.CaretOffset,
+            $"<Image Source=\"{{DynamicResource {asset.Id}}}\" Stretch=\"Uniform\" />");
+        _codeEditor.Focus();
+    }
+
+    private async void DeleteImageAssetClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        if ((sender as Control)?.DataContext is not ImageAsset row) return;
+        var asset = _imageAssets.FirstOrDefault(x => x.Base64 == row.Base64);
+        if (asset is null) return;
+        _imageAssets.Remove(asset);
+        Application.Current!.Resources.Remove(asset.Id);
+        if (_assetBitmaps.Remove(asset.Id, out var bitmap)) bitmap.Dispose();
+        try
         {
-            if (_imageAssetsList.SelectedItem is not ImageAsset asset) return;
-            this.FindControl<TabControl>("EditorTabs")!.SelectedIndex = 0;
-            _codeEditor.Document.Insert(_codeEditor.CaretOffset,
-                $"<Image Source=\"{{DynamicResource {asset.Id}}}\" Stretch=\"Uniform\" />");
-            _codeEditor.Focus();
-        };
+            await SaveImageAssetsAsync(_imageAssets);
+            RefreshAssetList();
+            RenderPreview();
+            _statusText.Text = $"已删除图片 {asset.Name}";
+        }
+        catch (Exception ex) { _statusText.Text = "删除失败：" + GetUsefulError(ex); }
+    }
+
+    private async void ImageAssetNameKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Enter) return;
+        e.Handled = true;
+        await CommitImageAssetNameAsync(sender as TextBox);
+    }
+
+    private async void ImageAssetNameLostFocus(object? sender, Avalonia.Interactivity.RoutedEventArgs e) =>
+        await CommitImageAssetNameAsync(sender as TextBox);
+
+    private async Task CommitImageAssetNameAsync(TextBox? editor)
+    {
+        if (editor?.DataContext is not ImageAsset asset) return;
+        var newName = editor.Text?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(newName)) return;
+
+        var stem = Path.GetFileNameWithoutExtension(newName);
+        var newId = SanitizeAssetId(stem);
+        if (newName == asset.Name && newId == asset.Id) return;
+        if (_imageAssets.Any(x => x.Id == newId && x.Id != asset.Id))
+        {
+            _statusText.Text = "图片名对应的资源键已存在，请换一个名称";
+            editor.Text = asset.Name;
+            return;
+        }
+
+        try
+        {
+            var renamed = asset with { Id = newId, Name = newName };
+            var index = _imageAssets.IndexOf(asset);
+            var bitmap = _assetBitmaps[asset.Id];
+            Application.Current!.Resources.Remove(asset.Id);
+            Application.Current.Resources[newId] = bitmap;
+            _assetBitmaps.Remove(asset.Id);
+            _assetBitmaps[newId] = bitmap;
+            _imageAssets[index] = renamed;
+            _codeEditor.Document.Text = _codeEditor.Document.Text.Replace(
+                $"{{DynamicResource {asset.Id}}}", $"{{DynamicResource {newId}}}");
+            await SaveImageAssetsAsync(_imageAssets);
+            RefreshAssetList();
+            _imageAssetsList.SelectedItem = renamed;
+            _statusText.Text = $"图片资源已重命名为 {newName}";
+        }
+        catch (Exception ex)
+        {
+            _statusText.Text = "重命名失败：" + GetUsefulError(ex);
+            editor.Text = asset.Name;
+        }
     }
 
     private async Task RestoreImageAssetsAsync()
@@ -63,8 +137,28 @@ public sealed partial class CardStudioView
         {
             var json = OperatingSystem.IsBrowser() ? await BrowserAssetStorage.LoadAsync()
                 : File.Exists(AssetFile) ? await File.ReadAllTextAsync(AssetFile) : "[]";
-            foreach (var asset in JsonSerializer.Deserialize<List<ImageAsset>>(json) ?? [])
+            var migrated = false;
+            foreach (var storedAsset in JsonSerializer.Deserialize<List<ImageAsset>>(json) ?? [])
+            {
+                var asset = storedAsset;
+                var cleanName = Path.GetFileNameWithoutExtension(asset.Name);
+                if (cleanName != asset.Name)
+                {
+                    asset = asset with { Name = cleanName };
+                    migrated = true;
+                }
+                var desiredId = SanitizeAssetId(asset.Name);
+                if (asset.Id != desiredId)
+                {
+                    var oldId = asset.Id;
+                    asset = asset with { Id = CreateUniqueAssetId(asset.Name) };
+                    _codeEditor.Document.Text = _codeEditor.Document.Text.Replace(
+                        $"{{DynamicResource {oldId}}}", $"{{DynamicResource {asset.Id}}}");
+                    migrated = true;
+                }
                 RegisterImageAsset(asset);
+            }
+            if (migrated) await SaveImageAssetsAsync(_imageAssets);
             RefreshAssetList();
         }
         catch (Exception ex) { _statusText.Text = "恢复图片失败：" + GetUsefulError(ex); }
@@ -85,6 +179,7 @@ public sealed partial class CardStudioView
     {
         using var stream = new MemoryStream(Convert.FromBase64String(asset.Base64));
         var bitmap = new Bitmap(stream);
+        asset.Preview = bitmap;
         Application.Current!.Resources[asset.Id] = bitmap;
         _assetBitmaps.Add(asset.Id, bitmap);
         _imageAssets.Add(asset);
@@ -111,8 +206,9 @@ public sealed partial class CardStudioView
                 await using var source = await file.OpenReadAsync();
                 using var buffer = new MemoryStream();
                 await source.CopyToAsync(buffer);
-                RegisterImageAsset(new ImageAsset("CardStudioImage_" + Guid.NewGuid().ToString("N"),
-                    file.Name, Convert.ToBase64String(buffer.ToArray())));
+                var name = Path.GetFileNameWithoutExtension(file.Name);
+                RegisterImageAsset(new ImageAsset(CreateUniqueAssetId(name),
+                    name, Convert.ToBase64String(buffer.ToArray())));
             }
             RefreshAssetList();
             await SaveImageAssetsAsync(_imageAssets);
@@ -123,5 +219,21 @@ public sealed partial class CardStudioView
             RefreshAssetList();
             _statusText.Text = "图片导入或保存失败：" + GetUsefulError(ex);
         }
+    }
+
+    private string CreateUniqueAssetId(string fileName)
+    {
+        var baseId = SanitizeAssetId(Path.GetFileNameWithoutExtension(fileName));
+        var candidate = baseId;
+        var suffix = 2;
+        while (_imageAssets.Any(x => x.Id == candidate)) candidate = $"{baseId}_{suffix++}";
+        return candidate;
+    }
+
+    private static string SanitizeAssetId(string value)
+    {
+        var id = Regex.Replace(value, @"[^A-Za-z0-9_]", "_");
+        if (string.IsNullOrEmpty(id) || !Regex.IsMatch(id, @"^[A-Za-z_]")) id = "Image_" + id;
+        return id;
     }
 }
